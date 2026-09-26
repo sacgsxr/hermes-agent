@@ -572,6 +572,19 @@ def _iter_model_entries(
         yield from _iter_model_entries(
             models, routed_base, suffix_fallback=suffix_fallback, provider=""
         )
+        return
+    # Vendor-namespaced fallback: OpenRouter catalogs key models as
+    # ``vendor/model`` (e.g. ``stealth/space-bunny-alpha``) while a session may
+    # name the bare model. Without this, capability lookup returns unknown for
+    # the bare name, and an UNKNOWN vision verdict is treated as "no vision" --
+    # silently dropping every image the user attaches. Only apply when the bare
+    # name is genuinely absent, and only when exactly one catalog id ends with
+    # ``/<model>``, so an ambiguous prefix cannot pick the wrong entry.
+    if "/" not in model:
+        suffix = "/" + model.lower()
+        matches = [mid for mid in models if isinstance(models.get(mid), dict) and mid.lower().endswith(suffix)]
+        if len(matches) == 1:
+            yield matches[0], models[matches[0]]
 
 
 def _find_model_entry(
