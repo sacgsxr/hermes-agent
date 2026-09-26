@@ -1420,3 +1420,48 @@ class TestOpencodeRelayVisionMarker:
         with patch("agent.models_dev.fetch_models_dev", return_value=registry):
             caps = get_model_capabilities("opencode-go", "deepseek-v4-flash-vision-exp")
         assert caps.supports_vision is False and caps.context_window == 500000
+
+
+class TestBareModelNameResolvesNamespacedCatalogEntry:
+    """OpenRouter catalogs key models as ``vendor/model`` while a session may name the bare
+    model. An unknown capability verdict is treated as "no vision", which silently dropped
+    every attached image, so the bare name must still reach its namespaced catalog entry."""
+
+    REGISTRY = {"openrouter": {"id": "openrouter", "models": {
+        "stealth/space-bunny-alpha": {
+            "id": "stealth/space-bunny-alpha",
+            "modalities": {"input": ["text", "image"]},
+            "limit": {"context": 64000, "output": 8192},
+        }}}}
+
+    def test_bare_name_finds_the_namespaced_entry(self):
+        with patch("agent.models_dev.fetch_models_dev", return_value=self.REGISTRY):
+            caps = get_model_capabilities("openrouter", "space-bunny-alpha")
+        assert caps is not None
+        assert caps.supports_vision is True
+        assert caps.context_window == 64000
+
+    def test_bare_name_matches_the_namespaced_result(self):
+        with patch("agent.models_dev.fetch_models_dev", return_value=self.REGISTRY):
+            bare = get_model_capabilities("openrouter", "space-bunny-alpha")
+            namespaced = get_model_capabilities("openrouter", "stealth/space-bunny-alpha")
+        assert bare == namespaced
+
+    def test_ambiguous_prefix_match_is_not_guessed(self):
+        """Two catalog ids ending in /<model> means the bare name is ambiguous -- resolving it
+        to either one would be a guess, so it must stay unknown rather than pick wrongly."""
+        registry = {"openrouter": {"id": "openrouter", "models": {
+            "stealth/space-bunny-alpha": {"id": "stealth/space-bunny-alpha", "limit": {"context": 1}},
+            "other/space-bunny-alpha": {"id": "other/space-bunny-alpha", "limit": {"context": 2}},
+        }}}
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            assert get_model_capabilities("openrouter", "space-bunny-alpha") is None
+
+    def test_exact_match_still_wins_over_the_prefix_fallback(self):
+        registry = {"openrouter": {"id": "openrouter", "models": {
+            "space-bunny-alpha": {"id": "space-bunny-alpha", "limit": {"context": 7}},
+            "stealth/space-bunny-alpha": {"id": "stealth/space-bunny-alpha", "limit": {"context": 8}},
+        }}}
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            caps = get_model_capabilities("openrouter", "space-bunny-alpha")
+        assert caps is not None and caps.context_window == 7
