@@ -30,7 +30,6 @@ import { Badge } from '@nous-research/ui/ui/components/badge'
 import { Card } from '@nous-research/ui/ui/components/card'
 
 import { ModelPickerDialog } from '@/components/ModelPickerDialog'
-import { ModelReloadConfirm } from '@/components/ModelReloadConfirm'
 import { ReasoningPicker } from '@/components/ReasoningPicker'
 import { GatewayClient, type ConnectionState } from '@/lib/gatewayClient'
 import { EventsFeedClient } from '@/lib/eventsFeedClient'
@@ -62,6 +61,18 @@ interface SessionInfo {
   title?: string
 }
 
+// Auto-redial budget for the JSON-RPC sidecar (#95951). After this many
+// bounded-backoff attempts the manual Reconnect affordance stays the only
+// path, mirroring the events feed's give-up contract.
+const SIDE_CAR_MAX_RECONNECT_ATTEMPTS = 5;
+
+// Surfaced once when the redial budget is exhausted. Only this module may
+// clear it (on the next successful open), matching how the events feed
+// owns its own banner messages.
+const SIDE_CAR_GAVE_UP_MESSAGE =
+  "gateway sidecar disconnected — gave up after " +
+  `${SIDE_CAR_MAX_RECONNECT_ATTEMPTS} attempts, use Reconnect`;
+
 const STATE_LABEL: Record<ConnectionState, string> = {
   idle: 'idle',
   connecting: 'connecting',
@@ -82,6 +93,8 @@ interface ChatSidebarProps {
   channel: string
   /** Chat profile from the dashboard switcher / URL scope. */
   profile?: string
+  /** Apply a picker choice to the live PTY session without restarting it. */
+  onLiveModelChange?: (provider: string, model: string) => "sent" | "not-sent"
   className?: string
   onDashboardNewSessionRequest?: () => void
   onSessionTitleChange?: (title: string | null) => void
@@ -105,6 +118,7 @@ export function sidecarSessionCreateParams(profile?: string): Record<string, unk
 export function ChatSidebar({
   channel,
   profile,
+  onLiveModelChange,
   className,
   onDashboardNewSessionRequest,
   onSessionTitleChange
@@ -118,6 +132,12 @@ export function ChatSidebar({
   const [version, setVersion] = useState(0)
   const gw = useMemo(() => new GatewayClient(), [])
   const feed = useMemo(() => new EventsFeedClient(), [])
+  // Sidecar auto-redial budget (#95951). A ref, NOT effect state: the counter
+  // must survive the [gw, version] effect re-runs a redial triggers, or the
+  // budget resets every attempt and never exhausts.
+  // Reset on a successful open and on scope switches.
+  const sidecarRedialAttemptRef = useRef(0)
+  const sidecarGaveUpRef = useRef(false)
 
   const [state, setState] = useState<ConnectionState>('idle')
   const [info, setInfo] = useState<SessionInfo>({})
@@ -140,12 +160,7 @@ export function ChatSidebar({
   // Bumped on model change/save so ReasoningPicker re-reads the saved effort
   // (config is profile-scoped the same way the model badge is).
   const [modelRefreshKey, setModelRefreshKey] = useState(0)
-  // Set after the picker saves a model and the user declines the reload: config
-  // is updated but the running session keeps its model until rebuilt.
   const [modelNotice, setModelNotice] = useState<string | null>(null)
-  // Short name of a just-saved model awaiting confirm to reload (a fresh chat
-  // session is how the running chat adopts it; we confirm before discarding it).
-  const [pendingReloadModel, setPendingReloadModel] = useState<string | null>(null)
 
   const refreshEffectiveModel = useCallback(() => {
     void api
@@ -175,6 +190,9 @@ export function ChatSidebar({
     if (prevScopeKey.current === scopeKey) return
     prevScopeKey.current = scopeKey
     setError(null)
+    // Fresh scope, fresh sidecar redial budget (#95951).
+    sidecarRedialAttemptRef.current = 0
+    sidecarGaveUpRef.current = false
     setVersion(v => v + 1)
   }, [scopeKey])
 
@@ -205,6 +223,57 @@ export function ChatSidebar({
       }
     })
 
+    // Auto-redial after a transient drop (#95951): a dashboard service
+    // restart closes the sidecar's WebSocket with 1012, and GatewayClient
+    // deliberately delegates reconnect policy to this connection owner.
+    // Bounded exponential backoff — the same shape the PTY pane uses —
+    // capped at SIDE_CAR_MAX_RECONNECT_ATTEMPTS; after that the manual
+    // Reconnect affordance stays the only path. A successful open resets
+    // the counter; unmount or a scope switch (version bump) cancels the
+    // pending timer because this effect tears down with the old client.
+    let redialTimer: ReturnType<typeof setTimeout> | null = null;
+    const offRedial = gw.onState((s) => {
+      if (s === "open") {
+        sidecarRedialAttemptRef.current = 0;
+        if (sidecarGaveUpRef.current) {
+          sidecarGaveUpRef.current = false;
+          setError((current) =>
+            current === SIDE_CAR_GAVE_UP_MESSAGE ? null : current,
+          );
+        }
+        return;
+      }
+      if (s !== "closed" && s !== "error") {
+        return;
+      }
+      if (cancelled || redialTimer) {
+        return;
+      }
+      // The attempt counter lives in a ref: each redial rebuilds the client
+      // and re-runs this effect, so a closure-local counter would reset and
+      // the budget would never exhaust (#95951).
+      if (sidecarRedialAttemptRef.current >= SIDE_CAR_MAX_RECONNECT_ATTEMPTS) {
+        // Mirror the events feed's give-up contract: say so once, then the
+        // manual Reconnect affordance stays the only path. Cleared again if
+        // a later connection does open (manual reconnect followed by a
+        // within-budget drop).
+        if (!sidecarGaveUpRef.current) {
+          sidecarGaveUpRef.current = true;
+          setError((current) => current ?? SIDE_CAR_GAVE_UP_MESSAGE);
+        }
+        return;
+      }
+      const attempt = sidecarRedialAttemptRef.current;
+      sidecarRedialAttemptRef.current += 1;
+      const delayMs = Math.min(250 * 2 ** attempt, 3000);
+      redialTimer = setTimeout(() => {
+        redialTimer = null;
+        if (!cancelled) {
+          setVersion((v) => v + 1);
+        }
+      }, delayMs);
+    });
+
     // Create the sidecar session so the gateway surfaces session-scoped
     // signals (connection state, credential warnings). It's independent of the
     // PTY pane's session by design. The model picker no longer rides this
@@ -227,12 +296,16 @@ export function ChatSidebar({
 
     return () => {
       cancelled = true
+      if (redialTimer) {
+        clearTimeout(redialTimer)
+        redialTimer = null
+      }
+      offRedial()
       offState()
       offSessionInfo()
       offError()
       gw.close()
     }
-    // `profile` is read from render; scope changes bump `version` → redial.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gw, version])
 
@@ -361,7 +434,6 @@ export function ChatSidebar({
   const reconnect = useCallback(() => {
     setError(null)
     setModelNotice(null)
-    setPendingReloadModel(null)
     setVersion(v => v + 1)
   }, [])
 
@@ -485,7 +557,6 @@ export function ChatSidebar({
           alwaysGlobal
           onApply={async ({ provider, model, confirmExpensiveModel }) => {
             setModelNotice(null)
-            setPendingReloadModel(null)
             const result = await api.setModelAssignment(
               {
                 confirm_expensive_model: confirmExpensiveModel,
@@ -499,8 +570,12 @@ export function ChatSidebar({
             // and calls back; don't announce until the user confirms.
             if (!result.confirm_required) {
               refreshEffectiveModel()
-              // Ask before reloading: applying the model starts a fresh chat.
-              setPendingReloadModel(model.split('/').slice(-1)[0])
+              const liveDispatch = onLiveModelChange?.(provider, model)
+              setModelNotice(
+                liveDispatch === "sent"
+                  ? `Model saved. The session command was sent; confirm the switch in the terminal before sending a response.`
+                  : `Model saved for new chats. The current chat was not changed; use /model in the chat when it is ready.`
+              )
             }
             return result
           }}
@@ -511,14 +586,7 @@ export function ChatSidebar({
         />
       )}
 
-      <ModelReloadConfirm
-        model={pendingReloadModel}
-        onCancel={() => {
-          const m = pendingReloadModel
-          setPendingReloadModel(null)
-          setModelNotice(`Model set to ${m}. Run /new or refresh the page to apply it to this chat.`)
-        }}
-      />
+
     </aside>
   )
 }

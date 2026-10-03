@@ -420,6 +420,26 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     (title: string | null) => setSessionTitleState({ scope: titleScope, title }),
     [titleScope],
   );
+  const applyLiveModel = useCallback((provider: string, model: string): "sent" | "not-sent" => {
+    const ws = wsRef.current;
+    // The PTY is a raw terminal, not an acknowledged control plane. Never
+    // inject a command while the user has a draft, or while the terminal is
+    // reconnecting/ended; the persisted choice remains safe for new sessions,
+    // but the current session must remain untouched.
+    if (
+      ws?.readyState !== WebSocket.OPEN ||
+      ptyStateRef.current !== "open" ||
+      ptyInputLineRef.current.length > 0
+    ) {
+      return "not-sent";
+    }
+    try {
+      ws.send(`/model ${model} --provider ${provider} --session\r`);
+      return "sent";
+    } catch {
+      return "not-sent";
+    }
+  }, []);
 
   useEffect(() => {
     if (!isActive) {
@@ -1491,10 +1511,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         setPtyState("closed");
         return;
       }
-      if (!ev.wasClean || ev.code === 1001 || ev.code === 1006) {
-        // Transient transport drop (refresh, sleep/wake, signal loss).
-        // Reconnect with backoff; the same ?attach= token reattaches to
-        // the still-living PTY, so the conversation continues in place.
+      if (
+        !ev.wasClean ||
+        ev.code === 1001 ||
+        ev.code === 1006 ||
+        ev.code === 1012 ||
+        ev.code === 1013
+      ) {
+        // Transient transport drop (refresh, sleep/wake, signal loss), or a
+        // clean server-side restart signal: 1012 Service Restart / 1013 Try
+        // Again Later mean the server is coming back, so redial instead of
+        // stranding the pane on "[session ended]" (#95951).
         scheduleReconnect(ev.code);
         return;
       }
@@ -1893,6 +1920,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
+                onLiveModelChange={applyLiveModel}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
@@ -2102,6 +2130,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
+                onLiveModelChange={applyLiveModel}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
