@@ -22,6 +22,8 @@ jobs:
           cache: npm
       - name: Install locked dependencies
         run: npm ci --no-audit --no-fund
+      - name: Typecheck dashboard
+        run: npm run typecheck --workspace web
       - name: Build dashboard
         run: npm run build --workspace web
       - name: Upload dashboard artifact
