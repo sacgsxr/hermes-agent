@@ -30,7 +30,6 @@ import { Badge } from '@nous-research/ui/ui/components/badge'
 import { Card } from '@nous-research/ui/ui/components/card'
 
 import { ModelPickerDialog } from '@/components/ModelPickerDialog'
-import { ModelReloadConfirm } from '@/components/ModelReloadConfirm'
 import { ReasoningPicker } from '@/components/ReasoningPicker'
 import { GatewayClient, type ConnectionState } from '@/lib/gatewayClient'
 import { EventsFeedClient } from '@/lib/eventsFeedClient'
@@ -94,6 +93,8 @@ interface ChatSidebarProps {
   channel: string
   /** Chat profile from the dashboard switcher / URL scope. */
   profile?: string
+  /** Apply a picker choice to the live PTY session without restarting it. */
+  onLiveModelChange?: (provider: string, model: string) => "sent" | "not-sent"
   className?: string
   onDashboardNewSessionRequest?: () => void
   onSessionTitleChange?: (title: string | null) => void
@@ -117,6 +118,7 @@ export function sidecarSessionCreateParams(profile?: string): Record<string, unk
 export function ChatSidebar({
   channel,
   profile,
+  onLiveModelChange,
   className,
   onDashboardNewSessionRequest,
   onSessionTitleChange
@@ -158,12 +160,7 @@ export function ChatSidebar({
   // Bumped on model change/save so ReasoningPicker re-reads the saved effort
   // (config is profile-scoped the same way the model badge is).
   const [modelRefreshKey, setModelRefreshKey] = useState(0)
-  // Set after the picker saves a model and the user declines the reload: config
-  // is updated but the running session keeps its model until rebuilt.
   const [modelNotice, setModelNotice] = useState<string | null>(null)
-  // Short name of a just-saved model awaiting confirm to reload (a fresh chat
-  // session is how the running chat adopts it; we confirm before discarding it).
-  const [pendingReloadModel, setPendingReloadModel] = useState<string | null>(null)
 
   const refreshEffectiveModel = useCallback(() => {
     void api
@@ -437,7 +434,6 @@ export function ChatSidebar({
   const reconnect = useCallback(() => {
     setError(null)
     setModelNotice(null)
-    setPendingReloadModel(null)
     setVersion(v => v + 1)
   }, [])
 
@@ -561,7 +557,6 @@ export function ChatSidebar({
           alwaysGlobal
           onApply={async ({ provider, model, confirmExpensiveModel }) => {
             setModelNotice(null)
-            setPendingReloadModel(null)
             const result = await api.setModelAssignment(
               {
                 confirm_expensive_model: confirmExpensiveModel,
@@ -575,8 +570,12 @@ export function ChatSidebar({
             // and calls back; don't announce until the user confirms.
             if (!result.confirm_required) {
               refreshEffectiveModel()
-              // Ask before reloading: applying the model starts a fresh chat.
-              setPendingReloadModel(model.split('/').slice(-1)[0])
+              const liveDispatch = onLiveModelChange?.(provider, model)
+              setModelNotice(
+                liveDispatch === "sent"
+                  ? `Model saved. The session command was sent; confirm the switch in the terminal before sending a response.`
+                  : `Model saved for new chats. The current chat was not changed; use /model in the chat when it is ready.`
+              )
             }
             return result
           }}
@@ -587,14 +586,7 @@ export function ChatSidebar({
         />
       )}
 
-      <ModelReloadConfirm
-        model={pendingReloadModel}
-        onCancel={() => {
-          const m = pendingReloadModel
-          setPendingReloadModel(null)
-          setModelNotice(`Model set to ${m}. Run /new or refresh the page to apply it to this chat.`)
-        }}
-      />
+
     </aside>
   )
 }

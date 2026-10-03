@@ -420,6 +420,26 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     (title: string | null) => setSessionTitleState({ scope: titleScope, title }),
     [titleScope],
   );
+  const applyLiveModel = useCallback((provider: string, model: string): "sent" | "not-sent" => {
+    const ws = wsRef.current;
+    // The PTY is a raw terminal, not an acknowledged control plane. Never
+    // inject a command while the user has a draft, or while the terminal is
+    // reconnecting/ended; the persisted choice remains safe for new sessions,
+    // but the current session must remain untouched.
+    if (
+      ws?.readyState !== WebSocket.OPEN ||
+      ptyStateRef.current !== "open" ||
+      ptyInputLineRef.current.length > 0
+    ) {
+      return "not-sent";
+    }
+    try {
+      ws.send(`/model ${model} --provider ${provider} --session\r`);
+      return "sent";
+    } catch {
+      return "not-sent";
+    }
+  }, []);
 
   useEffect(() => {
     if (!isActive) {
@@ -1900,6 +1920,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
+                onLiveModelChange={applyLiveModel}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
@@ -2109,6 +2130,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
+                onLiveModelChange={applyLiveModel}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
