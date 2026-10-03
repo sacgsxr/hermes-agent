@@ -2,6 +2,8 @@ name: Dashboard build artifact
 
 on:
   workflow_dispatch:
+  push:
+    branches: [fix/dashboard-model-repair]
 
 permissions:
   contents: read
